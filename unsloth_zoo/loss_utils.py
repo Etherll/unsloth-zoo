@@ -298,8 +298,14 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
     # Get num_items_in_batch
     if has_kwargs and len(batch_samples) > 0 and "labels" in batch_samples[0]:
         try:
+            is_encoder_decoder = "decoder_attention_mask" in batch_samples[0]
             if not "attention_mask" in batch_samples[0]: is_vlm = False
-            if not is_vlm:
+            if is_encoder_decoder:
+                 num_items_in_batch = sum(
+                    [((x["labels"] != -100) & (x["decoder_attention_mask"] != 0))\
+                    .sum() for x in batch_samples]
+                )
+            elif not is_vlm:
                 num_items_in_batch = sum(
                     [(x["labels"][..., 1:] != -100)\
                     .sum() for x in batch_samples]
