@@ -186,6 +186,7 @@ def get_transformers_model_type(
     revision = None,
     trust_remote_code = False,
 ):
+    do_logging = os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
     # All Unsloth Zoo code licensed under LGPLv3
     from transformers import AutoConfig
     from huggingface_hub.utils import disable_progress_bars, enable_progress_bars, are_progress_bars_disabled
@@ -207,7 +208,15 @@ def get_transformers_model_type(
     # Add splitted modules for eg gemma3_text -> gemma3
     model_types += [x.split("_")[0] for x in model_types]
     model_types = list(dict().fromkeys(model_types))
-
+    for model_type in model_types:
+        module_location = f"transformers.models.{model_type}.modeling_{model_type}"
+        try:
+            spec = importlib.util.find_spec(module_location)
+        except ModuleNotFoundError:
+            model_types.remove(model_type)
+            if do_logging:
+              print(f"Unsloth: Could not find the modeling file for the model type '{model_type}'.")
+            continue
     from transformers import models
     models = dir(models)
     all_model_types = set()
