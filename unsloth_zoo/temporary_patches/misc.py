@@ -569,3 +569,54 @@ def patch_GraniteMoeHybridMambaLayer_cuda_kernels_forward():
     patch_function(transformers.models.granitemoehybrid.modeling_granitemoehybrid.GraniteMoeHybridMambaLayer, "cuda_kernels_forward", cuda_kernels_forward)
 pass
 TEMPORARY_PATCHES.append(patch_GraniteMoeHybridMambaLayer_cuda_kernels_forward)
+
+def patch_VoxtralForConditionalGeneration_forward():
+    try:
+        import transformers.models.voxtral.modeling_voxtral
+        from transformers.models.voxtral.modeling_voxtral import VoxtralForConditionalGeneration
+        from transformers.modeling_outputs import CausalLMOutputWithPast , BaseModelOutputWithPast
+    except Exception as e:
+        raise_error("VoxtralForConditionalGeneration.forward", e)
+         
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        input_features: Optional[torch.FloatTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        **kwargs,
+    ) -> CausalLMOutputWithPast:
+
+        if inputs_embeds is None:
+            inputs_embeds = self.get_input_embeddings()(input_ids)
+
+        if input_features is not None:
+            audio_embeds = self.get_audio_embeds(input_features)
+            audio_token_mask = input_ids == self.config.audio_token_id
+            final_inputs_embeds = inputs_embeds.clone()
+            final_inputs_embeds[audio_token_mask] = audio_embeds
+            inputs_embeds = final_inputs_embeds
+
+        outputs: BaseModelOutputWithPast = self.language_model(
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            labels=labels,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            logits_to_keep=logits_to_keep,
+            **kwargs,
+        )
+        
+        return outputs
+    
+    patch_function(VoxtralForConditionalGeneration, "forward", forward)
+
+TEMPORARY_PATCHES.append(patch_VoxtralForConditionalGeneration_forward)
