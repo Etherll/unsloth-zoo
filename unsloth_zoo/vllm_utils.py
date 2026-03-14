@@ -1108,6 +1108,7 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
                 get_state_dict(f"{prefix}.q_proj", 0, state_dict, qkv_proj)
                 get_state_dict(f"{prefix}.k_proj", 1, state_dict, qkv_proj)
                 get_state_dict(f"{prefix}.v_proj", 2, state_dict, qkv_proj)
+            get_state_dict(f"{prefix}.o_proj", 0, state_dict, o_proj)
         elif hasattr(layer, "cross_attn"):
             prefix = f"{vllm_text_model_prefix}.layers.{kk}.cross_attn"
             qkv_proj = layer.cross_attn.qkv_proj
@@ -1119,8 +1120,46 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
             get_state_dict(f"{prefix}.q_proj", 0, state_dict, q_proj)
             get_state_dict(f"{prefix}.k_proj", 1, state_dict, kv_proj)
             get_state_dict(f"{prefix}.v_proj", 2, state_dict, kv_proj)
+            get_state_dict(f"{prefix}.o_proj", 0, state_dict, o_proj)
+        elif hasattr(layer, "linear_attn"):
+            # Qwen3.5/Qwen3-Next GDN (Gated Delta Net) linear attention layers
+            gdn_prefix = f"{vllm_text_model_prefix}.layers.{kk}.linear_attn"
+            linear_attn = layer.linear_attn
 
-        get_state_dict(f"{prefix}.o_proj", 0, state_dict, o_proj)
+            # in_proj_qkvz → HF's in_proj_qkv (q+k+v fused) and in_proj_z
+            qkvz_proj = getattr(linear_attn.in_proj_qkvz, "base_layer", linear_attn.in_proj_qkvz)
+            qkvz_weight = qkvz_proj.weight.data
+            qkvz_weight.requires_grad_(False)
+            output_sizes = list(qkvz_proj.output_sizes)
+            qkv_end = sum(output_sizes[:3])
+            state_dict[f"{gdn_prefix}.in_proj_qkv.weight"] = qkvz_weight[:qkv_end]
+            quant_state_dict[f"{gdn_prefix}.in_proj_qkv.weight"] = qkvz_weight[:qkv_end]
+            state_dict[f"{gdn_prefix}.in_proj_z.weight"] = qkvz_weight[qkv_end:]
+            quant_state_dict[f"{gdn_prefix}.in_proj_z.weight"] = qkvz_weight[qkv_end:]
+
+            # in_proj_ba → HF's in_proj_b and in_proj_a
+            get_state_dict(f"{gdn_prefix}.in_proj_b", 0, state_dict, linear_attn.in_proj_ba)
+            get_state_dict(f"{gdn_prefix}.in_proj_a", 1, state_dict, linear_attn.in_proj_ba)
+
+            # out_proj
+            get_state_dict(f"{gdn_prefix}.out_proj", 0, state_dict, linear_attn.out_proj, slice_weights=False)
+
+            # conv1d weight
+            conv1d_proj = getattr(linear_attn.conv1d, "base_layer", linear_attn.conv1d)
+            conv1d_weight = conv1d_proj.weight.data
+            conv1d_weight.requires_grad_(False)
+            state_dict[f"{gdn_prefix}.conv1d.weight"] = conv1d_weight
+            quant_state_dict[f"{gdn_prefix}.conv1d.weight"] = conv1d_weight
+
+            # dt_bias and A_log parameters
+            state_dict[f"{gdn_prefix}.dt_bias"] = linear_attn.dt_bias.data
+            quant_state_dict[f"{gdn_prefix}.dt_bias"] = linear_attn.dt_bias.data
+            state_dict[f"{gdn_prefix}.A_log"] = linear_attn.A_log.data
+            quant_state_dict[f"{gdn_prefix}.A_log"] = linear_attn.A_log.data
+
+            # norm (RMSNormGated) weight
+            state_dict[f"{gdn_prefix}.norm.weight"] = linear_attn.norm.weight.data
+            quant_state_dict[f"{gdn_prefix}.norm.weight"] = linear_attn.norm.weight.data
 
         proj = layer.mlp.gate_up_proj
         use_fused_gate_up = _is_fused_module("gate_up_proj")
@@ -1352,9 +1391,15 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
 
             if layer_name in quant_state_dict:
                 # for attributes of type nn.Parameter, there's no .weight
-                layer_name_br = re.sub(r"\.([\d]{1,})\.", r"[\1].", layer_name.replace('model.','',1))
                 layer = torch.nn.Parameter(weight, requires_grad = False)
-                exec(f"new_model.{layer_name_br} = layer")
+                # Use same path conversion as regular layers (line below) to handle
+                # models where language_model is nested under model (e.g. Qwen3.5)
+                layer_name_br = re.sub(r"\.([\d]{1,})\.", r"[\1].", layer_name.replace('model.','',1))
+                try:
+                    exec(f"new_model.{layer_name_br} = layer")
+                except AttributeError:
+                    layer_name_br = re.sub(r"\.([\d]{1,})", lambda x: f"[{x.group(1)}]", layer_name)
+                    exec(f"new_model.{layer_name_br} = layer")
                 continue
             elif fp8_weight_scale is not None:
                 if fp8_weight_scale.ndim == 1:

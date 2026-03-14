@@ -30,7 +30,7 @@ REMOVED_METRICS = [
     "mean_token_accuracy", # SFT extras
     "entropy",  # TRL >= 0.22.0
     "aux_loss", # TRL >= 0.23.0
-    
+
     # GRPO extras
     "clip_ratio",
     'clip_ratio/low_mean',
@@ -39,6 +39,13 @@ REMOVED_METRICS = [
     'clip_ratio/high_max',
     'clip_ratio/region_mean',
     'frac_reward_zero_std',
+
+    # Conditional metrics - only populated with vLLM importance sampling
+    'sampling/sampling_logp_difference/mean',
+    'sampling/sampling_logp_difference/max',
+    'sampling/importance_sampling_ratio/min',
+    'sampling/importance_sampling_ratio/mean',
+    'sampling/importance_sampling_ratio/max',
 ]
 REMOVED_METRICS = frozenset(REMOVED_METRICS)
 
@@ -65,10 +72,13 @@ def NotebookProgressCallback_on_train_begin(Trainer_metrics):
         self.first_column = "Epoch" if args.eval_strategy == IntervalStrategy.EPOCH else "Step"
         self.training_loss = 0
         self.last_log = 0
+        # Don't pre-create metric columns. Start with just the essentials;
+        # columns are added dynamically by write_line as metrics actually appear.
+        # This prevents empty "0 then blank" columns for conditional metrics
+        # (kl when beta=0, sampling/* without importance sampling, etc.)
         column_names = [self.first_column] + ["Training Loss"]
         if args.eval_strategy != IntervalStrategy.NO:
             column_names.append("Validation Loss")
-        column_names += [x.replace("/", " / ") for x in Trainer_metrics]
         self.training_tracker = NotebookTrainingTracker(state.max_steps, column_names)
     pass
     return _NotebookProgressCallback_on_train_begin
@@ -76,17 +86,38 @@ pass
 
 
 def NotebookProgressCallback_on_log(Trainer_metrics):
+    # Build an allowlist of known metrics (pre-extracted from TRL source).
+    # Only these + dynamic rewards/* metrics pass through. This blocks
+    # spurious keys injected at runtime (e.g. "train", "tools/*").
+    set_Trainer_metrics = frozenset(Trainer_metrics)
+
     def _NotebookProgressCallback_on_log(self, args, state, control, logs = None, **kwargs):
         # Only for when there is no evaluation
         if args.eval_strategy == IntervalStrategy.NO and "loss" in logs:
-            values = {"Training Loss": logs["loss"]}
+            values = {}
+
+            # 1) Pre-extracted metrics — only if actually present in logs
             for metric in Trainer_metrics:
-                # Sometimes metric is not inside logs
-                try: values[metric.replace("/", " / ")] = logs[metric]
-                except: pass
+                if metric in logs:
+                    values[metric.replace("/", " / ")] = logs[metric]
             pass
-            # First column is necessarily Step since we're not in epoch eval strategy
-            values["Step"] = state.global_step
+
+            # 2) Dynamic per-reward-function metrics (rewards/*)
+            #    These have user-defined names so can't be pre-extracted.
+            #    Sort for stable column ordering across steps.
+            dynamic_reward_keys = sorted(
+                k for k in logs
+                if k.startswith("rewards/") and k not in set_Trainer_metrics
+            )
+            for key in dynamic_reward_keys:
+                display_key = key.replace("/", " / ")
+                if display_key not in values:
+                    values[display_key] = logs[key]
+            pass
+
+            # 3) Prepend Training Loss + Step (always first columns)
+            values = {"Training Loss": logs["loss"], **values}
+            values[self.first_column] = state.global_step
             self.training_tracker.write_line(values)
         pass
     pass
@@ -95,7 +126,6 @@ pass
 
 
 def NotebookTrainingTracker_write_line(Trainer_metrics):
-    set_Trainer_metrics = set(Trainer_metrics)
     def _NotebookTrainingTracker_write_line(self, values):
         """
         Write the values in the inner table.
@@ -107,33 +137,34 @@ def NotebookTrainingTracker_write_line(Trainer_metrics):
             self.inner_table = [list(values.keys()), list(values.values())]
         else:
             columns = self.inner_table[0]
-            new_values = {}
-            for key, value in values.items():
-                lowered = key.lower()
-                if lowered in set_Trainer_metrics:
-                    new_values[lowered.replace("/", " / ")] = value
-                else:
-                    new_values[key] = value
+
+            # Dynamically add new columns that appear in values
+            # (e.g. per-reward-func metrics discovered at step > 1)
+            for key in values:
+                if key not in columns:
+                    columns.append(key)
+                    # Back-fill previous rows with empty string
+                    for row in self.inner_table[1:]:
+                        row.append("")
             pass
-            values = new_values
 
             self.inner_table[0] = columns
+            first_column = columns[0]
             if len(self.inner_table) > 1:
                 last_values = self.inner_table[-1]
-                first_column = self.inner_table[0][0]
                 if last_values[0] != values[first_column]:
                     # write new line
-                    self.inner_table.append([values[c] if c in values else "No Log" for c in columns])
+                    self.inner_table.append([values[c] if c in values else "" for c in columns])
                 else:
-                    # update last line
+                    # update last line — preserve existing values for missing keys
                     new_values = values
                     for c in columns:
-                        if c not in new_values.keys():
+                        if c not in new_values:
                             new_values[c] = last_values[columns.index(c)]
                     self.inner_table[-1] = [new_values[c] for c in columns]
             else:
-                # Edit for evaluation purposes
-                self.inner_table.append([values[c] if c in values else 0 for c in columns])
+                # First data row (after header)
+                self.inner_table.append([values[c] if c in values else "" for c in columns])
             pass
         pass
     pass
@@ -182,15 +213,23 @@ def get_trl_metrics():
         stats2 = re.findall(r"stats\[mode\]\[[\"\']([^\"\']{1,})[\"\']\]", file)
         metrics = metrics + metrics2 + stats2
 
-        # Get optional f-strings
+        # Get optional f-strings (variable at start: f"{var}suffix")
         metrics_f = re.findall(r"_?metrics\[f[\"\']\{[^\}]{1,}\}([^\"\']{1,})[\"\']\]", file)
         stats_f = re.findall(r"stats\[f[\"\']\{[^\}]{1,}\}([^\"\']{1,})[\"\']\]", file)
         metrics_f = metrics_f + stats_f
 
-        # Get optional f-strings for new TRL [mode]
+        # Get optional f-strings for new TRL [mode] (variable at start)
         metrics_f2 = re.findall(r"_?metrics\[mode\]\[f[\"\']\{[^\}]{1,}\}([^\"\']{1,})[\"\']\]", file)
         stats_f2 = re.findall(r"stats\[mode\]\[f[\"\']\{[^\}]{1,}\}([^\"\']{1,})[\"\']\]", file)
         metrics_f = metrics_f + metrics_f2 + stats_f2
+
+        # Get f-strings with literal prefix before variable: f"prefix/{var}/suffix"
+        # Captures (prefix, suffix) pairs — these are dynamic columns we can't
+        # pre-create, but we note them so the table can add them at runtime.
+        metrics_f3 = re.findall(r"_?metrics(?:\[mode\])?\[f[\"\']([^\"\']*?)\{[^\}]{1,}\}([^\"\']*?)[\"\']\]", file)
+        stats_f3 = re.findall(r"stats(?:\[mode\])?\[f[\"\']([^\"\']*?)\{[^\}]{1,}\}([^\"\']*?)[\"\']\]", file)
+        # These are dynamic (contain runtime variable names) so we can't add them
+        # as fixed columns. The write_line and on_log patches handle them dynamically.
 
         # Filter out prefixes if seen
         # metrics[f"{prefix}rewards/chosen"]

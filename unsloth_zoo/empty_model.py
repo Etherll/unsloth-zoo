@@ -374,6 +374,8 @@ def create_empty_vision_model(config, dtype = torch.float16):
         new_config.vision_config.out_hidden_size = 1
     elif model_type == "qwen3_vl":
         new_config.vision_config.out_hidden_size = 1
+    elif model_type == "qwen3_5":
+        new_config.vision_config.out_hidden_size = 1
 
 
     num_layers = max(text_layers, vision_layers)
@@ -402,6 +404,10 @@ def create_empty_model(config, dtype = torch.float16, is_vision_model = False):
 def set_additional_modules(new_model, quant_state_dict, config):
     if hasattr(new_model, "language_model"):
         language_model = new_model.language_model
+        language_model_prefix = "model.language_model"
+    elif hasattr(new_model, "model") and hasattr(new_model.model, "language_model"):
+        # Qwen3.5 style: language_model nested under model
+        language_model = new_model.model.language_model
         language_model_prefix = "model.language_model"
     else:
         language_model_prefix = "model"
@@ -440,6 +446,18 @@ def set_additional_modules(new_model, quant_state_dict, config):
     if 'model.visual.pos_embed.weight' in quant_state_dict:
         # This is to handle visual embeddings in Qwen 3 VL
         set_embedding(new_model.model.visual.pos_embed, 'model.visual.pos_embed.weight', None, requires_grad=False)
+
+    # GDN (Gated Delta Net) conv1d weights for Qwen3.5 hybrid layers
+    import re as _re
+    for key in list(quant_state_dict.keys()):
+        if "linear_attn.conv1d.weight" in key:
+            conv1d_path = key.replace(".weight", "")
+            conv1d_path_br = _re.sub(r"\.([\d]{1,})\.", r"[\1].", conv1d_path)
+            try:
+                conv1d_module = eval(f"new_model.{conv1d_path_br}")
+                conv1d_module.weight = torch.nn.Parameter(quant_state_dict[key], requires_grad=False)
+            except Exception:
+                pass
 
     # Norm
     norm_key = f"{language_model_prefix}.norm.weight"
@@ -539,6 +557,24 @@ def get_model_layer_config(return_non_layered=True):
             "model.layers.{kk}.mlp.up_proj",
             "model.layers.{kk}.mlp.gate_up_proj", # for extracting from vLLM (phi3 architecture)
             "model.layers.{kk}.mlp.down_proj",
+
+            # Qwen3.5 GDN (Gated Delta Net) linear attention layers
+            "model.language_model.layers.{kk}.linear_attn.in_proj_qkv",
+            "model.language_model.layers.{kk}.linear_attn.in_proj_z",
+            "model.language_model.layers.{kk}.linear_attn.in_proj_b",
+            "model.language_model.layers.{kk}.linear_attn.in_proj_a",
+            "model.language_model.layers.{kk}.linear_attn.out_proj",
+            "model.language_model.layers.{kk}.linear_attn.dt_bias",
+            "model.language_model.layers.{kk}.linear_attn.A_log",
+            "model.language_model.layers.{kk}.linear_attn.norm",
+            "model.layers.{kk}.linear_attn.in_proj_qkv",
+            "model.layers.{kk}.linear_attn.in_proj_z",
+            "model.layers.{kk}.linear_attn.in_proj_b",
+            "model.layers.{kk}.linear_attn.in_proj_a",
+            "model.layers.{kk}.linear_attn.out_proj",
+            "model.layers.{kk}.linear_attn.dt_bias",
+            "model.layers.{kk}.linear_attn.A_log",
+            "model.layers.{kk}.linear_attn.norm",
         },
         'layernorms': {
             "model.language_model.layers.{kk}.input_layernorm",
@@ -790,7 +826,7 @@ def extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_stat
 
             if layer_module is not None:
                 if "qkv" in layer_path:
-                    if model_type in ("qwen2_5_vl", "qwen3_vl"):
+                    if model_type in ("qwen2_5_vl", "qwen3_vl", "qwen3_5"):
                         # If the HF model too prefers having merged qkv, we do this
                         # This is evident in qwen-2.5-vl and qwen-3-vl so far.
                         get_state_dict(layer_path, 0, state_dict, layer_module, slice_weights=False)
