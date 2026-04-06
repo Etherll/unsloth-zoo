@@ -322,41 +322,25 @@ def patch_model_and_tokenizer(
         except:
             correct_dtype = model.get_input_embeddings().weight.dtype
     pass
-    # If we force float32, we first use bfloat16, then downcast to float16
+    # If we force float32, we loaded in bfloat16. Keep weights in bfloat16
+    # (same exponent range as fp32, no overflow). On T4, bf16 is emulated as fp32.
+    # Previously this downcast to fp16 which caused loss divergence due to overflow.
     if do_forced_float32:
-        correct_dtype = torch.float16
+        correct_dtype = torch.bfloat16
         for name, module in model.named_modules():
             if hasattr(module, "_pre_set_compute_dtype"):
-                setted_dtype = module._pre_set_compute_dtype
-            else:
-                setted_dtype = torch.float16
-            if "down_proj" in name or "up_proj" in name or "gate_proj" in name or "fc1" in name or "fc2" in name:
-                module.to(setted_dtype)
-            if "q_proj" in name or "k_proj" in name or "v_proj" in name or "o_proj" in name or "out_proj" in name:
-                module.to(setted_dtype)
-            if "lm_head" in name or "embed_tokens" in name:
-                module.to(setted_dtype)
-            if "embed_tokens" in name or "patch_embedding" in name:
-                module.to(setted_dtype)
-            if name.endswith("norm") and hasattr(module, "weight"):
-                module.to(setted_dtype)
-            if "bias" in name:
-                module.to(setted_dtype)
+                module.to(module._pre_set_compute_dtype)
             torch.cuda.empty_cache()
 
-        # Convert any remaining bfloat16 parameters
+        # Convert any remaining parameters with _pre_set_compute_dtype
         for name, param in model.named_parameters():
             if hasattr(param, "_pre_set_compute_dtype"):
                 param.data = param.data.to(param._pre_set_compute_dtype)
-            elif param.dtype == torch.bfloat16:
-                param.data = param.data.to(torch.float16)
 
-        # Also convert buffers (like position embeddings)
+        # Also convert buffers with _pre_set_compute_dtype
         for name, buffer in model.named_buffers():
             if hasattr(buffer, "_pre_set_compute_dtype"):
                 buffer.data = buffer.data.to(buffer._pre_set_compute_dtype)
-            elif buffer.dtype == torch.bfloat16:
-                buffer.data = buffer.data.to(torch.float16)
         pass
     pass
 
